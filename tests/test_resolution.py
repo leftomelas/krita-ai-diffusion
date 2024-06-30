@@ -3,8 +3,8 @@ from pathlib import Path
 
 from ai_diffusion import resolution, workflow
 from ai_diffusion.api import InpaintMode
-from ai_diffusion.image import Bounds, Extent, Image, Mask
-from ai_diffusion.resolution import ScaledExtent, ScaleMode, CheckpointResolution
+from ai_diffusion.image import Bounds, Extent, Image, Mask, Point
+from ai_diffusion.resolution import ScaledExtent, ScaleMode, CheckpointResolution, TileLayout
 from ai_diffusion.resources import SDVersion
 from ai_diffusion.style import Style
 from ai_diffusion.settings import PerformanceSettings
@@ -132,14 +132,11 @@ def test_inpaint_context(area, expected_extent, expected_crop: tuple[int, int] |
 )
 def test_prepare_highres(input, expected_initial, expected_desired):
     image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    r, _ = resolution.prepare_masked(image, mask, SDVersion.sd15, dummy_style, perf)
+    r, _ = resolution.prepare_image(image, SDVersion.sd15, dummy_style, perf)
     assert (
         r.initial_image
         and r.extent.input == r.initial_image.extent
         and r.initial_image.extent == expected_initial
-        and r.initial_mask
-        and r.initial_mask.extent == expected_initial
         and r.extent.initial == expected_initial
         and r.extent.desired == expected_desired
         and r.extent.target == input
@@ -156,13 +153,10 @@ def test_prepare_highres(input, expected_initial, expected_desired):
 )
 def test_prepare_lowres(input: Extent, expected: Extent):
     image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    r, _ = resolution.prepare_masked(image, mask, SDVersion.sd15, dummy_style, perf)
+    r, _ = resolution.prepare_image(image, SDVersion.sd15, dummy_style, perf)
     assert (
         r.extent.input == input
         and image.extent == input
-        and r.initial_mask
-        and r.initial_mask.extent == input
         and r.extent.target == input
         and r.extent.initial == expected
         and r.extent.desired == expected
@@ -175,13 +169,10 @@ def test_prepare_lowres(input: Extent, expected: Extent):
 )
 def test_prepare_passthrough(input: Extent):
     image = Image.create(input)
-    mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    r, _ = resolution.prepare_masked(image, mask, SDVersion.sd15, dummy_style, perf)
+    r, _ = resolution.prepare_image(image, SDVersion.sd15, dummy_style, perf)
     assert (
         r.initial_image
-        and r.initial_mask
         and r.initial_image == image
-        and r.initial_mask.extent == input
         and r.extent.input == input
         and r.extent.initial == input
         and r.extent.target == input
@@ -283,13 +274,11 @@ def test_prepare_resolution_multiplier_inputs():
     input = Extent(1024, 1024)
     image = Image.create(input)
     mask = Mask.rectangle(Bounds(0, 0, input.width, input.height))
-    r, _ = resolution.prepare_masked(image, mask, SDVersion.sd15, dummy_style, perf_settings)
+    r, _ = resolution.prepare_image(image, SDVersion.sd15, dummy_style, perf_settings)
     assert (
         r.extent.input == Extent(512, 512)
         and r.initial_image
         and r.initial_image.extent == Extent(512, 512)
-        and r.initial_mask
-        and r.initial_mask.extent == Extent(512, 512)
         and r.extent.initial == Extent(512, 512)
         and r.extent.desired == Extent(512, 512)
         and r.extent.target == Extent(1024, 1024)
@@ -305,3 +294,57 @@ def test_prepare_resolution_multiplier_max(multiplier, expected):
     input = Extent(2048, 2048)
     r, _ = resolution.prepare_extent(input, SDVersion.sd15, dummy_style, perf_settings)
     assert r.extent.initial.width <= 632 and r.extent.desired == expected
+
+
+tile_layouts = {
+    "1024-512": {
+        "extent": Extent(1024, 1024),
+        "min_tile_size": 512,
+        "padding": 32,
+        "tile_count": (2, 2),
+        "tile_size": (544, 544),
+        "tiles": [
+            {"start": Point(0, 0), "end": Point(544, 544)},
+            {"start": Point(0, 480), "end": Point(544, 1024)},
+            {"start": Point(480, 0), "end": Point(1024, 544)},
+            {"start": Point(480, 480), "end": Point(1024, 1024)},
+        ],
+    },
+    "2240-1024": {
+        "extent": Extent(2880, 2240),
+        "min_tile_size": 1024,
+        "padding": 48,
+        "tile_count": (3, 2),
+        "tile_size": (1024, 1168),
+        "tiles": [
+            {"start": Point(0, 0), "end": Point(1024, 1168)},
+            {"start": Point(0, 1072), "end": Point(1024, 2240)},
+            {"start": Point(928, 0), "end": Point(1952, 1168)},
+            {"start": Point(928, 1072), "end": Point(1952, 2240)},
+            {"start": Point(1856, 0), "end": Point(2880, 1168)},
+            {"start": Point(1856, 1072), "end": Point(2880, 2240)},
+        ],
+    },
+    "single-tile": {
+        "extent": Extent(800, 800),
+        "min_tile_size": 896,
+        "padding": 32,
+        "tile_count": (1, 1),
+        "tile_size": (800, 800),
+        "tiles": [{"start": Point(0, 0), "end": Point(800, 800)}],
+    },
+}
+
+
+@pytest.mark.parametrize("test_set", tile_layouts.keys())
+def test_tile_layout(test_set):
+    params = tile_layouts[test_set]
+    layout = TileLayout(params["extent"], params["min_tile_size"], params["padding"])
+    assert layout.tile_count == params["tile_count"]
+    assert layout.tile_extent == params["tile_size"]
+    assert layout.total_tiles == len(params["tiles"])
+    for i in range(layout.total_tiles):
+        expected = params["tiles"][i]
+        coord = layout.coord(i)
+        assert layout.start(coord) == expected["start"]
+        assert layout.end(coord) == expected["end"]

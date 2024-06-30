@@ -88,13 +88,13 @@ class PackageGroupWidget(QWidget):
         self._layout.addWidget(self._status, 0, 1)
 
         if description:
-            self._desc = QLabel(self)
-            self._desc.setText(description)
-            self._desc.setContentsMargins(20, 0, 0, 0)
-            self._desc.setWordWrap(True)
-            self._desc.setTextFormat(Qt.TextFormat.RichText)
-            self._desc.setOpenExternalLinks(True)
-            self._layout.addWidget(self._desc, 1, 0, 1, 2)
+            desc = self._desc = QLabel(self)
+            desc.setText(description)
+            desc.setContentsMargins(20, 0, 0, 0)
+            desc.setWordWrap(True)
+            desc.setTextFormat(Qt.TextFormat.RichText)
+            desc.setOpenExternalLinks(True)
+            self._layout.addWidget(desc, 1, 0, 1, 2)
 
         self._is_checkable = is_checkable
         self._items = [self.add_item(p, initial) for p in packages]
@@ -385,14 +385,19 @@ class ServerWidget(QWidget):
 
     def _select_location(self):
         path = self._server.path
-        if not self._server.path.exists():
+        if not path.exists():
+            path = path.parent
+        if not path.exists():
             path = Path(Settings._server_path.default)
             path.mkdir(parents=True, exist_ok=True)
         path = QFileDialog.getExistingDirectory(
             self, "Select Directory", str(path), QFileDialog.ShowDirsOnly
         )
         if path:
-            self._location_edit.setText(path)
+            path = Path(path)
+            if path != Path(Settings._server_path.default) and not (path / "ComfyUI").exists():
+                path = path / "ComfyUI"
+            self._location_edit.setText(str(path))
 
     def _change_backend(self):
         backends = ServerBackend.supported()

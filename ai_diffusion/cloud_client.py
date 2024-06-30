@@ -8,14 +8,15 @@ from base64 import b64encode
 from datetime import datetime
 from dataclasses import dataclass
 
-from .api import WorkflowInput
+from .api import WorkflowInput, WorkflowKind
 from .client import Client, ClientEvent, ClientMessage, ClientModels, DeviceInfo, CheckpointInfo
 from .client import User
-from .image import Image, ImageCollection
+from .image import Extent, ImageCollection
 from .network import RequestManager, NetworkError
 from .resources import SDVersion
-from .settings import PerformanceSettings
-from .util import ensure, client_logger as log
+from .settings import PerformanceSettings, settings
+from .util import clamp, ensure, client_logger as log
+from . import __version__ as plugin_version
 
 
 @dataclass
@@ -30,7 +31,8 @@ class JobInfo:
 
 
 class CloudClient(Client):
-    default_url = os.getenv("INTERSTICE_URL", "https://interstice.cloud")
+    default_api_url = os.getenv("INTERSTICE_URL", "https://api.interstice.cloud")
+    default_web_url = os.getenv("INTERSTICE_WEB_URL", "https://www.interstice.cloud")
 
     _requests = RequestManager()
     _queue: asyncio.Queue[JobInfo]
@@ -53,10 +55,10 @@ class CloudClient(Client):
         self._queue = asyncio.Queue()
 
     async def _get(self, op: str):
-        return await self._requests.get(f"{self.url}/api/{op}", bearer=self._token)
+        return await self._requests.get(f"{self.url}/{op}", bearer=self._token)
 
     async def _post(self, op: str, data: dict):
-        return await self._requests.post(f"{self.url}/api/{op}", data, bearer=self._token)
+        return await self._requests.post(f"{self.url}/{op}", data, bearer=self._token)
 
     async def sign_in(self):
         client_id = str(uuid.uuid4())
@@ -64,8 +66,9 @@ class CloudClient(Client):
         log.info(f"Sending authorization request for {info} to {self.url}")
         init = await self._post("auth/initiate", dict(client_id=client_id, client_info=info))
 
-        log.info(f"Waiting for completion of authorization at {self.url}{init['url']}")
-        yield f"{self.url}{init['url']}"
+        sign_in_url = f"{self.default_web_url}{init['url']}"
+        log.info(f"Waiting for completion of authorization at {sign_in_url}")
+        yield sign_in_url
 
         auth_confirm = await self._post("auth/confirm", dict(client_id=client_id))
         time = datetime.now()
@@ -88,7 +91,7 @@ class CloudClient(Client):
             raise ValueError("Authorization missing for cloud endpoint")
         self._token = token
         try:
-            user_data = await self._get("user")
+            user_data = await self._get(f"user?plugin_version={plugin_version}")
         except NetworkError as e:
             log.error(f"Couldn't authenticate user account: {e.message}")
             self._token = ""
@@ -102,7 +105,8 @@ class CloudClient(Client):
         return self._user
 
     async def enqueue(self, work: WorkflowInput, front: bool = False):
-        work.batch_count = min(work.batch_count, 8)
+        if work.models:
+            work.models.self_attention_guidance = False
         job = JobInfo(str(uuid.uuid4()), work)
         await self._queue.put(job)
         return job.local_id
@@ -139,7 +143,7 @@ class CloudClient(Client):
         job.remote_id = response["id"]
         job.worker_id = response["worker_id"]
         cost = _update_user(user, response.get("user"))
-        log.info(f"{job} started, cost was {cost}, {user.credits} images remaining")
+        log.info(f"{job} started, cost was {cost}, {user.credits} tokens remaining")
         yield ClientMessage(ClientEvent.progress, job.local_id, 0)
 
         while response["status"] == "IN_QUEUE" or response["status"] == "IN_PROGRESS":
@@ -190,7 +194,11 @@ class CloudClient(Client):
 
     @property
     def performance_settings(self):
-        return PerformanceSettings(batch_size=8, resolution_multiplier=1.0, max_pixel_count=8)
+        return PerformanceSettings(
+            batch_size=clamp(settings.batch_size, 4, 8),
+            resolution_multiplier=settings.resolution_multiplier,
+            max_pixel_count=clamp(settings.max_pixel_count, 1, 8),
+        )
 
     async def _send_images(self, inputs: dict):
         if image_data := inputs.get("image_data"):
@@ -220,6 +228,10 @@ class CloudClient(Client):
             return ImageCollection.from_base64(b64, offsets)
         else:
             raise ValueError(f"No result images found in server response: {str(images)[:80]}")
+
+    async def compute_cost(self, input: WorkflowInput):
+        response = await self._post("admin/cost", input.to_dict())
+        return int(response.decode())
 
     def _process_http_error(self, e: NetworkError):
         message = e.message
@@ -276,6 +288,7 @@ models.checkpoints = {
     "juggernautXL_version6Rundiffusion.safetensors": CheckpointInfo(
         "juggernautXL_version6Rundiffusion.safetensors", SDVersion.sdxl
     ),
+    "zavychromaxl_v80.safetensors": CheckpointInfo("zavychromaxl_v80.safetensors", SDVersion.sdxl),
 }
 models.vae = []
 models.loras = []
@@ -291,20 +304,22 @@ from ai_diffusion.resources import resource_id, ResourceKind, ControlMode, Upsca
 models.resources = {
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.inpaint): "control_v11p_sd15_inpaint_fp16.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.scribble): "control_lora_rank128_v11p_sd15_scribble_fp16.safetensors",
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.scribble): "sai_xl_sketch_256lora.safetensors",
+    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.scribble): "mistoLine_rank256.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.line_art): "control_v11p_sd15_lineart_fp16.safetensors",
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.line_art): "sai_xl_sketch_256lora.safetensors",
+    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.line_art): "mistoLine_rank256.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.soft_edge): "control_v11p_sd15_softedge_fp16.safetensors",
+    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.soft_edge): "mistoLine_rank256.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.canny_edge): "control_v11p_sd15_canny_fp16.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.canny_edge): "sai_xl_canny_256lora.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.depth): "control_lora_rank128_v11f1p_sd15_depth_fp16.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.depth): "sai_xl_depth_256lora.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.normal): None,
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.pose): "control_lora_rank128_v11p_sd15_openpose_fp16.safetensors",
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.pose): "thibaud_xl_openpose_256lora.safetensors",
+    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.pose): "controlnetxlCNXL_xinsirOpenpose.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.segmentation): None,
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.blur):"control_lora_rank128_v11f1e_sd15_tile_fp16.safetensors",
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.stencil): None,
+    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.blur):"TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors",
+    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.stencil): "control_v1p_sd15_qrcode_monster.safetensors",
     resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.hands): None,
     resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.hands): None,
     resource_id(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.reference): "ip-adapter_sd15.safetensors",
@@ -314,6 +329,8 @@ models.resources = {
     resource_id(ResourceKind.clip_vision, SDVersion.all, "ip_adapter"): "clip-vision_vit-h.safetensors",
     resource_id(ResourceKind.lora, SDVersion.sd15, "lcm"): "lcm-lora-sdv1-5.safetensors",
     resource_id(ResourceKind.lora, SDVersion.sdxl, "lcm"): "lcm-lora-sdxl.safetensors",
+    resource_id(ResourceKind.lora, SDVersion.sd15, "hyper"): "Hyper-SD15-8steps-CFG-lora.safetensors",
+    resource_id(ResourceKind.lora, SDVersion.sdxl, "hyper"): "Hyper-SDXL-8steps-CFG-lora.safetensors",
     resource_id(ResourceKind.lora, SDVersion.sd15, ControlMode.face): None,
     resource_id(ResourceKind.lora, SDVersion.sdxl, ControlMode.face): None,
     resource_id(ResourceKind.upscaler, SDVersion.all, UpscalerName.default): UpscalerName.default.value,

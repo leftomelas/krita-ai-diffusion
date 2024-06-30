@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Optional, Any
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from .util import is_macos, is_windows, encode_json, user_data_dir, client_logger as log
+from .util import is_macos, is_windows, user_data_dir, client_logger as log
+from .util import encode_json, read_json_with_comments
 
 
 class ServerMode(Enum):
@@ -35,12 +36,21 @@ class ServerBackend(Enum):
             return ServerBackend.cuda
 
 
+class ApplyBehavior(Enum):
+    replace = 0
+    layer = 1
+    layer_group = 2
+    layer_hide_below = 3
+    transparency_mask = 4
+
+
 class PerformancePreset(Enum):
     auto = "Automatic"
     cpu = "CPU"
     low = "GPU low (up to 6GB)"
     medium = "GPU medium (6GB to 12GB)"
     high = "GPU high (more than 12GB)"
+    cloud = "Cloud"
     custom = "Custom"
 
 
@@ -48,7 +58,7 @@ class PerformancePreset(Enum):
 class PerformanceSettings:
     batch_size: int = 4
     resolution_multiplier: float = 1.0
-    max_pixel_count: int = 8
+    max_pixel_count: int = 6
 
 
 class Setting:
@@ -141,8 +151,24 @@ class Settings(QObject):
         "Auto Preview", True, "Automatically preview the first generated result on the canvas"
     )
 
-    show_control_end: bool
-    _show_control_end = Setting("Control ending step", False, "Show control ending step ratio")
+    show_steps: bool
+    _show_steps = Setting(
+        "Show Steps", False, "Display the number of steps to be evaluated in the weights box."
+    )
+
+    apply_behavior: ApplyBehavior
+    _apply_behavior = Setting(
+        "Apply Behavior",
+        ApplyBehavior.layer_hide_below,
+        "Choose how result images are applied to the canvas (generation workspaces)",
+    )
+
+    apply_behavior_live: ApplyBehavior
+    _apply_behavior_live = Setting(
+        "Apply Behavior (Live)",
+        ApplyBehavior.replace,
+        "Choose how result images are applied to the canvas in Live mode",
+    )
 
     show_builtin_styles: bool
     _show_builtin_styles = Setting("Show pre-installed styles", True)
@@ -182,7 +208,7 @@ class Settings(QObject):
     max_pixel_count: int
     _max_pixel_count = Setting(
         "Maximum Pixel Count",
-        8,
+        6,
         "Maximum resolution to generate images at, in megapixels (FullHD ~ 2MP, 4k ~ 8MP).",
     )
 
@@ -200,12 +226,17 @@ class Settings(QObject):
         PerformancePreset.medium: PerformanceSettings(
             batch_size=4,
             resolution_multiplier=1.0,
-            max_pixel_count=8,
+            max_pixel_count=6,
         ),
         PerformancePreset.high: PerformanceSettings(
+            batch_size=6,
+            resolution_multiplier=1.0,
+            max_pixel_count=8,
+        ),
+        PerformancePreset.cloud: PerformanceSettings(
             batch_size=8,
             resolution_multiplier=1.0,
-            max_pixel_count=12,
+            max_pixel_count=6,
         ),
     }
 
@@ -223,7 +254,7 @@ class Settings(QObject):
 
     def __init__(self):
         super().__init__()
-        self.restore()
+        self.restore(init=True)
 
     def __getattr__(self, name: str):
         if name in self._values:
@@ -239,10 +270,12 @@ class Settings(QObject):
         else:
             object.__setattr__(self, name, value)
 
-    def restore(self):
+    def restore(self, init=False):
         self.__dict__["_values"] = {
             k[1:]: v.default for k, v in Settings.__dict__.items() if isinstance(v, Setting)
         }
+        if not init:
+            self.server_mode = ServerMode.managed
 
     def save(self, path: Optional[Path] = None):
         path = self.default_path or path
@@ -257,8 +290,8 @@ class Settings(QObject):
             return
 
         log.info(f"Loading settings from {path}")
-        with open(path, "r") as file:
-            contents = json.loads(file.read())
+        try:
+            contents = read_json_with_comments(path)
             for k, v in contents.items():
                 setting = getattr(Settings, f"_{k}", None)
                 if setting is not None:
@@ -269,6 +302,8 @@ class Settings(QObject):
                     else:
                         log.error(f"{path}: {v} is not a valid value for '{k}'")
                         self._values[k] = setting.default
+        except Exception as e:
+            log.error(f"Failed to load settings: {e}")
 
     def apply_performance_preset(self, preset: PerformancePreset):
         if preset not in [PerformancePreset.custom, PerformancePreset.auto]:

@@ -3,12 +3,13 @@ import json
 from dataclasses import dataclass, asdict
 from typing import Any
 from PyQt5.QtCore import QObject, QByteArray, QBuffer
-from PyQt5.QtGui import QImage
+from PyQt5.QtGui import QImageReader
 from PyQt5.QtWidgets import QMessageBox
 
 from .image import Bounds, Image, ImageCollection, ImageFileFormat
 from .model import Model
-from .control import ControlLayer
+from .control import ControlLayer, ControlLayerList
+from .region import RootRegion, Region
 from .jobs import Job, JobKind, JobParams, JobQueue
 from .style import Style, Styles
 from .properties import serialize, deserialize
@@ -28,8 +29,7 @@ class _HistoryResult:
 
     @staticmethod
     def from_dict(data: dict[str, Any]):
-        data["params"]["bounds"] = Bounds(*data["params"]["bounds"])
-        data["params"] = JobParams(**data["params"])
+        data["params"] = JobParams.from_dict(data["params"])
         return _HistoryResult(**data)
 
 
@@ -62,8 +62,13 @@ class ModelSync:
         state["upscale"] = _serialize(model.upscale)
         state["live"] = _serialize(model.live)
         state["animation"] = _serialize(model.animation)
-        state["control"] = [_serialize(c) for c in model.control]
         state["history"] = [asdict(h) for h in self._history]
+        state["root"] = _serialize(model.regions)
+        state["control"] = [_serialize(c) for c in model.regions.control]
+        state["regions"] = []
+        for region in model.regions:
+            state["regions"].append(_serialize(region))
+            state["regions"][-1]["control"] = [_serialize(c) for c in region.control]
         state_str = json.dumps(state, indent=2)
         state_bytes = QByteArray(state_str.encode("utf-8"))
         model.document.annotate("ui.json", state_bytes)
@@ -75,10 +80,14 @@ class ModelSync:
         _deserialize(model.upscale, state.get("upscale", {}))
         _deserialize(model.live, state.get("live", {}))
         _deserialize(model.animation, state.get("animation", {}))
-
+        _deserialize(model.regions, state.get("root", {}))
         for control_state in state.get("control", []):
-            model.control.add()
-            _deserialize(model.control[-1], control_state)
+            _deserialize(model.regions.control.emplace(), control_state)
+        for region_state in state.get("regions", []):
+            region = model.regions.emplace()
+            _deserialize(region, region_state)
+            for control_state in region_state.get("control", []):
+                _deserialize(region.control.emplace(), control_state)
 
         for result in state.get("history", []):
             item = _HistoryResult.from_dict(result)
@@ -97,17 +106,32 @@ class ModelSync:
         model.upscale.modified.connect(self._save)
         model.live.modified.connect(self._save)
         model.animation.modified.connect(self._save)
-        model.control.added.connect(self._track_control)
-        model.control.removed.connect(self._save)
-        for control in model.control:
-            self._track_control(control)
         model.jobs.job_finished.connect(self._save_results)
         model.jobs.job_discarded.connect(self._remove_results)
         model.jobs.result_discarded.connect(self._remove_image)
+        self._track_regions(model.regions)
 
     def _track_control(self, control: ControlLayer):
         self._save()
         control.modified.connect(self._save)
+
+    def _track_control_layers(self, control_layers: ControlLayerList):
+        control_layers.added.connect(self._track_control)
+        control_layers.removed.connect(self._save)
+        for control in control_layers:
+            self._track_control(control)
+
+    def _track_region(self, region: Region):
+        region.modified.connect(self._save)
+        self._track_control_layers(region.control)
+
+    def _track_regions(self, root_region: RootRegion):
+        root_region.added.connect(self._track_region)
+        root_region.removed.connect(self._save)
+        root_region.modified.connect(self._save)
+        self._track_control_layers(root_region.control)
+        for region in root_region:
+            self._track_region(region)
 
     def _save_results(self, job: Job):
         if job.kind is JobKind.diffusion and len(job.results) > 0:
@@ -174,3 +198,41 @@ def _find_annotation(document, name: str):
     if result := document.find_annotation(without_ext):
         return result
     return None
+
+
+def import_prompt_from_file(model: Model):
+    exts = (".png", ".jpg", ".jpeg", ".webp")
+    filename = model.document.filename
+    if model.regions.positive == "" and model.regions.negative == "" and filename.endswith(exts):
+        try:
+            reader = QImageReader(filename)
+            # A1111
+            if text := reader.text("parameters"):
+                if "Negative prompt:" in text:
+                    positive, negative = text.split("Negative prompt:", 1)
+                    model.regions.positive = positive.strip()
+                    model.regions.negative = negative.split("Steps:", 1)[0].strip()
+            # ComfyUI
+            elif text := reader.text("prompt"):
+                prompt: dict[str, dict] = json.loads(text)
+                for node in prompt.values():
+                    if node["class_type"] in _comfy_sampler_types:
+                        inputs = node["inputs"]
+                        model.regions.positive = _find_text_prompt(prompt, inputs["positive"][0])
+                        model.regions.negative = _find_text_prompt(prompt, inputs["negative"][0])
+
+        except Exception as e:
+            log.warning(f"Failed to read PNG metadata from {filename}: {e}")
+
+
+_comfy_sampler_types = ["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced"]
+
+
+def _find_text_prompt(workflow: dict[str, dict], node_key: str):
+    if node := workflow.get(node_key):
+        if node["class_type"] == "CLIPTextEncode":
+            return node.get("inputs", {}).get("text", "")
+        for input in node.get("inputs", {}).values():
+            if isinstance(input, list):
+                return _find_text_prompt(workflow, input[0])
+    return ""

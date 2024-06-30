@@ -7,6 +7,7 @@ import math
 import json
 
 from .image import Bounds, Extent, Image
+from .resources import SDVersion
 
 
 class ComfyRunMode(Enum):
@@ -169,17 +170,137 @@ class ComfyWorkflow:
             return_with_leftover_noise="disable",
         )
 
+    def sampler_custom_advanced(
+        self,
+        model: Output,
+        positive: Output,
+        negative: Output,
+        latent_image: Output,
+        model_version: SDVersion,
+        sampler="dpmpp_2m_sde_gpu",
+        scheduler="normal",
+        steps=20,
+        start_at_step=0,
+        cfg=7.0,
+        seed=-1,
+    ):
+        self.sample_count += steps - start_at_step
+
+        return self.add(
+            "SamplerCustomAdvanced",
+            output_count=2,
+            noise=self.random_noise(seed),
+            guider=self.cfg_guider(model, positive, negative, cfg),
+            sampler=self.sampler_select(sampler),
+            sigmas=self.split_sigmas(
+                self.scheduler_sigmas(model, scheduler, steps, model_version), start_at_step
+            )[1],
+            latent_image=latent_image,
+        )[1]
+
+    def scheduler_sigmas(
+        self, model: Output, scheduler="normal", steps=20, model_version=SDVersion.sdxl
+    ):
+        if scheduler in ("align_your_steps", "ays"):
+            assert model_version in (SDVersion.sd15, SDVersion.sdxl)
+
+            if model_version == SDVersion.sd15:
+                model_type = "SD1"
+            else:
+                model_type = "SDXL"
+
+            return self.add(
+                "AlignYourStepsScheduler",
+                output_count=1,
+                steps=steps,
+                model_type=model_type,
+                denoise=1.0,
+            )
+        elif scheduler == "gits":
+            return self.add(
+                "GITSScheduler",
+                output_count=1,
+                steps=steps,
+                coeff=1.2,
+                denoise=1.0,
+            )
+        elif scheduler in ("polyexponential", "poly_exponential"):
+            return self.add(
+                "PolyexponentialScheduler",
+                output_count=1,
+                steps=steps,
+                sigma_max=14.61,
+                sigma_min=0.03,
+                rho=1.0,
+            )
+        else:
+            return self.add(
+                "BasicScheduler",
+                output_count=1,
+                model=model,
+                scheduler=scheduler,
+                steps=steps,
+                denoise=1.0,
+            )
+
+    def split_sigmas(self, sigmas: Output, step=0):
+        return self.add(
+            "SplitSigmas",
+            output_count=2,
+            sigmas=sigmas,
+            step=step,
+        )
+
+    def cfg_guider(self, model: Output, positive: Output, negative: Output, cfg=7.0):
+        return self.add(
+            "CFGGuider",
+            output_count=1,
+            model=model,
+            positive=positive,
+            negative=negative,
+            cfg=cfg,
+        )
+
+    def random_noise(self, noise_seed=-1):
+        return self.add(
+            "RandomNoise",
+            output_count=1,
+            noise_seed=noise_seed,
+        )
+
+    def sampler_select(self, sampler_name="dpmpp_2m_sde_gpu"):
+        if sampler_name == "euler_cfgpp":
+            return self.add(
+                "SamplerEulerCFGpp",
+                output_count=1,
+                version="regular",
+            )
+        else:
+            return self.add(
+                "KSamplerSelect",
+                output_count=1,
+                sampler_name=sampler_name,
+            )
+
     def differential_diffusion(self, model: Output):
         return self.add("DifferentialDiffusion", 1, model=model)
 
     def model_sampling_discrete(self, model: Output, sampling: str, zsnr=False):
         return self.add("ModelSamplingDiscrete", 1, model=model, sampling=sampling, zsnr=zsnr)
 
+    def model_sampling_sd3(self, model: Output, shift=3.0):
+        return self.add("ModelSamplingSD3", 1, model=model, shift=shift)
+
     def rescale_cfg(self, model: Output, multiplier=0.7):
         return self.add("RescaleCFG", 1, model=model, multiplier=multiplier)
 
     def load_checkpoint(self, checkpoint: str):
         return self.add_cached("CheckpointLoaderSimple", 3, ckpt_name=checkpoint)
+
+    def load_dual_clip(self, clip_name1: str, clip_name2: str, type="sd3"):
+        return self.add_cached(
+            "DualCLIPLoader", 1, clip_name1=clip_name1, clip_name2=clip_name2, type=type
+        )
 
     def load_vae(self, vae_name: str):
         return self.add_cached("VAELoader", 1, vae_name=vae_name)
@@ -221,10 +342,11 @@ class ComfyWorkflow:
     def load_fooocus_inpaint(self, head: str, patch: str):
         return self.add_cached("INPAINT_LoadFooocusInpaint", 1, head=head, patch=patch)
 
-    def empty_latent_image(self, extent: Extent, batch_size=1):
-        return self.add(
-            "EmptyLatentImage", 1, width=extent.width, height=extent.height, batch_size=batch_size
-        )
+    def empty_latent_image(self, extent: Extent, version: SDVersion, batch_size=1):
+        w, h = extent.width, extent.height
+        if version is SDVersion.sd3:
+            return self.add("EmptySD3LatentImage", 1, width=w, height=h, batch_size=batch_size)
+        return self.add("EmptyLatentImage", 1, width=w, height=h, batch_size=batch_size)
 
     def clip_set_last_layer(self, clip: Output, clip_layer: int):
         return self.add("CLIPSetLastLayer", 1, clip=clip, stop_at_clip_layer=clip_layer)
@@ -256,6 +378,17 @@ class ComfyWorkflow:
 
     def conditioning_combine(self, a: Output, b: Output):
         return self.add("ConditioningCombine", 1, conditioning_1=a, conditioning_2=b)
+
+    def background_region(self, conditioning: Output):
+        return self.add("ETN_BackgroundRegion", 1, conditioning=conditioning)
+
+    def define_region(self, regions: Output, mask: Output, conditioning: Output):
+        return self.add(
+            "ETN_DefineRegion", 1, regions=regions, mask=mask, conditioning=conditioning
+        )
+
+    def attention_mask(self, model: Output, regions: Output):
+        return self.add("ETN_AttentionMask", 1, model=model, regions=regions)
 
     def apply_controlnet(
         self,
@@ -301,7 +434,9 @@ class ComfyWorkflow:
         clip_vision: Output,
         embeds: Output,
         weight: float,
+        weight_type: str = "linear",
         range: tuple[float, float] = (0.0, 1.0),
+        mask: Output | None = None,
     ):
         return self.add(
             "IPAdapterEmbeds",
@@ -311,9 +446,11 @@ class ComfyWorkflow:
             pos_embed=embeds,
             clip_vision=clip_vision,
             weight=weight,
-            weight_type="linear",
+            weight_type=weight_type,
+            embeds_scaling="V only",
             start_at=range[0],
             end_at=range[1],
+            attn_mask=mask,
         )
 
     def apply_ip_adapter_face(
@@ -325,6 +462,7 @@ class ComfyWorkflow:
         image: Output,
         weight=1.0,
         range: tuple[float, float] = (0.0, 1.0),
+        mask: Output | None = None,
     ):
         return self.add(
             "IPAdapterFaceID",
@@ -339,7 +477,11 @@ class ComfyWorkflow:
             weight_type="linear",
             start_at=range[0],
             end_at=range[1],
+            attn_mask=mask,
         )
+
+    def apply_self_attention_guidance(self, model: Output):
+        return self.add("SelfAttentionGuidance", 1, model=model, scale=0.5, blur_sigma=2.0)
 
     def inpaint_preprocessor(self, image: Output, mask: Output):
         return self.add("InpaintPreprocessor", 1, image=image, mask=mask)
@@ -404,14 +546,14 @@ class ComfyWorkflow:
             height=bounds.height,
         )
 
-    def scale_image(self, image: Output, extent: Extent):
+    def scale_image(self, image: Output, extent: Extent, method="lanczos"):
         return self.add(
             "ImageScale",
             1,
             image=image,
             width=extent.width,
             height=extent.height,
-            upscale_method="bilinear",
+            upscale_method=method,
             crop="disabled",
         )
 
@@ -453,7 +595,7 @@ class ComfyWorkflow:
 
     def scale_mask(self, mask: Output, extent: Extent):
         img = self.mask_to_image(mask)
-        scaled = self.scale_image(img, extent)
+        scaled = self.scale_image(img, extent, method="bilinear")
         return self.image_to_mask(scaled)
 
     def image_to_mask(self, image: Output):
@@ -485,7 +627,10 @@ class ComfyWorkflow:
     def blur_masked(self, image: Output, mask: Output, blur: int, falloff: int = 0):
         return self.add("INPAINT_MaskedBlur", 1, image=image, mask=mask, blur=blur, falloff=falloff)
 
-    def denoise_to_compositing_mask(self, mask: Output, offset=0.15, threshold=0.25):
+    def expand_mask(self, mask: Output, grow: int, blur: int):
+        return self.add("INPAINT_ExpandMask", 1, mask=mask, grow=grow, blur=blur)
+
+    def denoise_to_compositing_mask(self, mask: Output, offset=0.05, threshold=0.35):
         return self.add(
             "INPAINT_DenoiseToCompositingMask", 1, mask=mask, offset=offset, threshold=threshold
         )
@@ -511,53 +656,32 @@ class ComfyWorkflow:
     def save_image(self, image: Output, prefix: str):
         return self.add("SaveImage", 1, images=image, filename_prefix=prefix)
 
-    def upscale_tiled(
-        self,
-        image: Output,
-        model: Output,
-        vae: Output,
-        positive: Output,
-        negative: Output,
-        upscale_model: Output,
-        original_extent: Extent,
-        factor: float,
-        tile_extent: Extent,
-        steps: int,
-        cfg: float,
-        sampler: str,
-        scheduler: str,
-        denoise: float,
-        seed=-1,
-    ):
-        target_extent = original_extent * factor
-        tiles_w = int(math.ceil(target_extent.width / tile_extent.width))
-        tiles_h = int(math.ceil(target_extent.height / tile_extent.height))
-        self.sample_count += 4 + tiles_w * tiles_h * steps  # approx, ignores padding
+    def create_tile_layout(self, image: Output, tile_size: int, padding: int, blending: int):
         return self.add(
-            "UltimateSDUpscale",
+            "ETN_TileLayout",
             1,
             image=image,
-            model=model,
-            positive=positive,
-            negative=negative,
-            vae=vae,
-            upscale_model=upscale_model,
-            upscale_by=factor,
-            seed=seed,
-            steps=steps,
-            cfg=cfg,
-            sampler_name=sampler,
-            scheduler=scheduler,
-            denoise=denoise,
-            tile_width=tile_extent.width,
-            tile_height=tile_extent.height,
-            mode_type="Linear",
-            mask_blur=8,
-            tile_padding=32,
-            seam_fix_mode="None",
-            seam_fix_denoise=1.0,
-            seam_fix_width=64,
-            seam_fix_mask_blur=8,
-            seam_fix_padding=16,
-            force_uniform_tiles="enable",
+            min_tile_size=tile_size,
+            padding=padding,
+            blending=blending,
         )
+
+    def extract_image_tile(self, image: Output, layout: Output, index: int):
+        return self.add("ETN_ExtractImageTile", 1, image=image, layout=layout, index=index)
+
+    def extract_mask_tile(self, mask: Output, layout: Output, index: int):
+        return self.add("ETN_ExtractMaskTile", 1, mask=mask, layout=layout, index=index)
+
+    def merge_image_tile(self, image: Output, layout: Output, index: int, tile: Output):
+        return self.add("ETN_MergeImageTile", 1, layout=layout, index=index, tile=tile, image=image)
+
+    def generate_tile_mask(self, layout: Output, index: int):
+        return self.add("ETN_GenerateTileMask", 1, layout=layout, index=index)
+
+    def estimate_pose(self, image: Output, resolution: int):
+        feat = dict(detect_hand="enable", detect_body="enable", detect_face="enable")
+        mdls = dict(bbox_detector="yolox_l.onnx", pose_estimator="dw-ll_ucoco_384.onnx")
+        if self._run_mode is ComfyRunMode.runtime:
+            # use smaller model, but it requires onnxruntime, see #630
+            mdls["bbox_detector"] = "yolo_nas_l_fp16.onnx"
+        return self.add("DWPreprocessor", 1, image=image, resolution=resolution, **feat, **mdls)

@@ -31,7 +31,6 @@ class ExtentInput:
 class ImageInput:
     extent: ExtentInput
     initial_image: Image | None = None
-    initial_mask: Image | None = None
     hires_image: Image | None = None
     hires_mask: Image | None = None
 
@@ -58,6 +57,7 @@ class CheckpointInput:
     loras: list[LoraInput] = field(default_factory=list)
     clip_skip: int = 0
     v_prediction_zsnr: bool = False
+    self_attention_guidance: bool = False
 
 
 @dataclass
@@ -79,18 +79,28 @@ class SamplingInput:
 
 
 @dataclass
-class TextInput:
-    positive: str
-    negative: str = ""
-    style: str = ""
+class ControlInput:
+    mode: ControlMode
+    image: Image | None = None
+    strength: float = 1.0
+    range: tuple[float, float] = (0.0, 1.0)
 
 
 @dataclass
-class ControlInput:
-    mode: ControlMode
-    image: Image
-    strength: float = 1.0
-    range: tuple[float, float] = (0.0, 1.0)
+class RegionInput:
+    mask: Image
+    bounds: Bounds
+    positive: str
+    control: list[ControlInput] = field(default_factory=list)
+
+
+@dataclass
+class ConditioningInput:
+    positive: str
+    negative: str = ""
+    style: str = ""
+    control: list[ControlInput] = field(default_factory=list)
+    regions: list[RegionInput] = field(default_factory=list)
 
 
 class InpaintMode(Enum):
@@ -117,6 +127,8 @@ class InpaintParams:
     mode: InpaintMode
     target_bounds: Bounds
     fill: FillMode = FillMode.neutral
+    grow: int = 0
+    feather: int = 0
     use_inpaint_model: bool = False
     use_condition_mask: bool = False
     use_reference: bool = False
@@ -128,8 +140,7 @@ class WorkflowInput:
     images: ImageInput | None = None
     models: CheckpointInput | None = None
     sampling: SamplingInput | None = None
-    text: TextInput | None = None
-    control: list[ControlInput] = field(default_factory=list)
+    conditioning: ConditioningInput | None = None
     inpaint: InpaintParams | None = None
     crop_upscale_extent: Extent | None = None
     upscale_model: str = ""
@@ -156,13 +167,34 @@ class WorkflowInput:
         return Serializer.run(self, image_format)
 
     @property
+    def diffusion_extent(self):
+        if self.crop_upscale_extent:
+            return Extent.largest(self.extent.initial, self.crop_upscale_extent)
+        return self.extent.desired
+
+    @property
+    def passes_count(self):
+        if self.kind is WorkflowKind.upscale_tiled:
+            tile_count_w = math.ceil(self.extent.target.width / self.extent.desired.width)
+            tile_count_h = math.ceil(self.extent.target.height / self.extent.desired.height)
+            return 2 * max(1, tile_count_w * tile_count_h)
+        return self.batch_count
+
+    @property
     def cost(self):
-        if self.kind in [WorkflowKind.control_image, WorkflowKind.upscale_simple]:
+        if self.kind is WorkflowKind.control_image:
+            return 1
+        if self.kind is WorkflowKind.upscale_simple:
             return 2
-        steps = ensure(self.sampling).actual_steps
-        unit = 2 * Extent(1024, 1024).pixel_count * 20
-        cost = self.batch_count * self.extent.desired.pixel_count * steps
-        return math.ceil((10 * cost) / unit)
+
+        def cost_factor(batch: int, extent: Extent, steps: int):
+            return batch * extent.pixel_count * math.sqrt(extent.pixel_count) * steps
+
+        base = 1 if ensure(self.models).version is SDVersion.sd15 else 2
+        steps = max(8, ensure(self.sampling).actual_steps)
+        unit = cost_factor(2, Extent(1024, 1024), 24)
+        cost = cost_factor(self.passes_count, self.diffusion_extent, steps)
+        return base + round((10 * cost) / unit)
 
 
 class Serializer:
@@ -211,7 +243,7 @@ class Deserializer:
     _images: ImageCollection
 
     @staticmethod
-    def run(data: dict[str, Any]):
+    def run(data: dict[str, Any]) -> WorkflowInput:
         if image_data := data.get("image_data"):
             blob, offsets = image_data["bytes"], image_data["offsets"]
             images = ImageCollection.from_bytes(blob, offsets)

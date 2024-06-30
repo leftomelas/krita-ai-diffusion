@@ -6,23 +6,27 @@ import importlib.util
 import os
 import subprocess
 import sys
+import json
 import logging
 import logging.handlers
 import statistics
 import zipfile
-from typing import Iterable, Optional, Sequence, TypeVar
+from typing import Callable, Iterable, Optional, Sequence, TypeVar
 from PyQt5.QtCore import QStandardPaths
 
 T = TypeVar("T")
+R = TypeVar("R")
 
 is_windows = sys.platform.startswith("win")
 is_macos = sys.platform == "darwin"
 is_linux = not is_windows and not is_macos
 
+plugin_dir = dir = Path(__file__).parent
+
 
 def _get_user_data_dir():
     if importlib.util.find_spec("krita") is None:
-        dir = Path(__file__).parent.parent / ".appdata"
+        dir = plugin_dir.parent / ".appdata"
         dir.mkdir(exist_ok=True)
         return dir
     try:
@@ -45,7 +49,7 @@ def _get_log_dir():
     dir = user_data_dir / "logs"
     dir.mkdir(exist_ok=True)
 
-    legacy_dir = Path(__file__).parent / ".logs"
+    legacy_dir = plugin_dir / ".logs"
     try:  # Move logs from old location (v1.14 and earlier)
         if legacy_dir.exists():
             for file in legacy_dir.iterdir():
@@ -77,23 +81,34 @@ server_logger = create_logger("krita.ai_diffusion.server", log_dir / "server.log
 
 
 def log_error(error: Exception):
+    message = str(error)
     if isinstance(error, AssertionError):
         message = f"Error: Internal assertion failed [{error}]"
-    else:
-        message = f"Error: {error}"
+    elif not message.startswith("Error:"):
+        message = f"Error: {message}"
     client_logger.exception(message)
     return message
 
 
-def ensure(value: Optional[T]) -> T:
-    assert value is not None
+def ensure(value: Optional[T], msg="") -> T:
+    assert value is not None, msg or "a value is required"
     return value
+
+
+def maybe(func: Callable[[T], R], value: Optional[T]) -> Optional[R]:
+    if value is not None:
+        return func(value)
+    return None
 
 
 def batched(iterable, n):
     it = iter(iterable)
     while batch := tuple(islice(it, n)):
         yield batch
+
+
+def clamp(value: int, min_value: int, max_value: int):
+    return max(min(value, max_value), min_value)
 
 
 def median_or_zero(values: Iterable[float]) -> float:
@@ -103,10 +118,26 @@ def median_or_zero(values: Iterable[float]) -> float:
         return 0
 
 
+def unique(seq: Sequence[T], key) -> list[T]:
+    seen = set()
+    return [x for x in seq if (k := key(x)) not in seen and not seen.add(k)]
+
+
+def trim_text(text: str, max_length: int) -> str:
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
 def encode_json(obj):
     if isinstance(obj, Enum):
         return obj.name
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
+def read_json_with_comments(path: Path):
+    lines = path.read_text().splitlines()
+    return json.loads("\n".join("" if line.strip().startswith("//") else line for line in lines))
 
 
 def sanitize_prompt(prompt: str):
@@ -126,27 +157,6 @@ def find_unused_path(path: Path):
     while (new_path := path.with_name(f"{stem}-{i}{ext}")).exists():
         i += 1
     return new_path
-
-
-def get_path_dict(paths: Sequence[str]) -> dict:
-    """Builds a tree like structure out of a list of paths. The leaf nodes point to the original
-    path string. It's important the string remains unchanged, see #307"""
-
-    def _recurse(dic: dict, chain: tuple[str, ...] | list[str], full_path: str):
-        if len(chain) == 0:
-            return
-        if len(chain) == 1:
-            dic[chain[0]] = full_path
-            return
-        key, *new_chain = chain
-        _recurse(dic.setdefault(key, {}), new_chain, full_path)
-        return
-
-    new_path_dict = {}
-    for path in paths:
-        parts = Path(path.replace("\\", "/")).parts
-        _recurse(new_path_dict, parts, path)
-    return new_path_dict
 
 
 if is_linux:
@@ -185,9 +195,12 @@ async def create_process(
         program, *args, cwd=cwd, stdout=out, stderr=err, env=env, **platform_args
     )
     if is_windows:
-        from . import win32
+        try:
+            from . import win32
 
-        win32.attach_process_to_job(p.pid)
+            win32.attach_process_to_job(p.pid)
+        except Exception as e:
+            client_logger.error(f"Failed to attach process to job: {e}")
     return p
 
 

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, Optional, cast
+from typing import Callable, cast
 
 from PyQt5.QtWidgets import (
     QAction,
@@ -10,7 +10,6 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMenu,
     QSpinBox,
-    QDoubleSpinBox,
     QToolButton,
     QComboBox,
     QHBoxLayout,
@@ -21,29 +20,32 @@ from PyQt5.QtWidgets import (
     QWidgetAction,
     QCheckBox,
     QGridLayout,
+    QCompleter,
+    QPushButton,
+    QFrame,
 )
 from PyQt5.QtGui import (
-    QColor,
     QFontMetrics,
     QKeyEvent,
     QMouseEvent,
     QPalette,
     QTextCursor,
     QPainter,
+    QIcon,
+    QPaintEvent,
 )
-from PyQt5.QtCore import Qt, QMetaObject, QSize, pyqtSignal
-import krita
+from PyQt5.QtCore import QObject, Qt, QMetaObject, QSize, QStringListModel, pyqtSignal, QEvent
 
 from ..style import Style, Styles
-from ..resources import ControlMode
 from ..root import root
 from ..client import filter_supported_styles, resolve_sd_version
 from ..properties import Binding, Bind, bind, bind_combo
-from ..jobs import JobState, JobQueue
-from ..model import Model, Workspace, ControlLayer, SamplingQuality
-from ..text import edit_attention, select_on_cursor_pos
+from ..jobs import JobState, JobKind
+from ..model import Model, Workspace, SamplingQuality
+from ..text import LoraId, edit_attention, select_on_cursor_pos
 from ..util import ensure
-from .settings import SettingsDialog
+from ..workflow import apply_strength, snap_to_percent
+from .settings import SettingsDialog, settings
 from .theme import SignalBlocker
 from . import actions, theme
 
@@ -224,218 +226,6 @@ class QueueButton(QToolButton):
         _paint_tool_drop_down(self, self.text())
 
 
-class ControlWidget(QWidget):
-    _model: Model
-    _control: ControlLayer
-    _connections: list[QMetaObject.Connection | Binding]
-
-    def __init__(self, model: Model, control: ControlLayer, parent: ControlListWidget):
-        super().__init__(parent)
-        self._model = model
-        self._control = control
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(layout)
-
-        self.mode_select = QComboBox(self)
-        self.mode_select.setStyleSheet(theme.flat_combo_stylesheet)
-        for mode in (m for m in ControlMode if m is not ControlMode.inpaint):
-            icon = theme.icon(f"control-{mode.name}")
-            self.mode_select.addItem(icon, mode.text, mode)
-
-        self.layer_select = QComboBox(self)
-        self.layer_select.setMinimumContentsLength(20)
-        self.layer_select.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
-        )
-        self._update_layers()
-        self._model.layers.changed.connect(self._update_layers)
-
-        self.generate_button = QToolButton(self)
-        self.generate_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.generate_button.setIcon(theme.icon("control-generate"))
-        self.generate_button.setToolTip("Generate control layer from current image")
-        self.generate_button.clicked.connect(control.generate)
-
-        self.add_pose_button = QToolButton(self)
-        self.add_pose_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.add_pose_button.setIcon(theme.icon("add-pose"))
-        self.add_pose_button.clicked.connect(self._add_pose_character)
-
-        self.strength_spin = QSpinBox(self)
-        self.strength_spin.setRange(0, 100)
-        self.strength_spin.setValue(int(control.strength * 100))
-        self.strength_spin.setSuffix("%")
-        self.strength_spin.setSingleStep(10)
-        self.strength_spin.setToolTip("Control strength")
-
-        self.end_spin = QDoubleSpinBox(self)
-        self.end_spin.setRange(0.0, 1.0)
-        self.end_spin.setValue(control.end)
-        self.end_spin.setSingleStep(0.1)
-        self.end_spin.setToolTip("Control ending step ratio")
-
-        self.error_text = QLabel(self)
-        self.error_text.setStyleSheet(f"color: {theme.red};")
-        self.error_text.setVisible(not control.is_supported)
-        self._set_error(control.error_text)
-
-        self.remove_button = QToolButton(self)
-        self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.remove_button.setIcon(theme.icon("remove"))
-        self.remove_button.setToolTip("Remove control layer")
-        button_height = self.remove_button.iconSize().height()
-        self.remove_button.setIconSize(QSize(int(button_height * 1.25), button_height))
-        self.remove_button.setAutoRaise(True)
-        self.remove_button.clicked.connect(self.remove)
-
-        layout.addWidget(self.mode_select)
-        layout.addWidget(self.layer_select, 1)
-        layout.addWidget(self.generate_button)
-        layout.addWidget(self.add_pose_button)
-        layout.addWidget(self.strength_spin)
-        layout.addWidget(self.end_spin)
-        layout.addWidget(self.error_text, 1)
-        layout.addWidget(self.remove_button)
-
-        self._update_visibility()
-        self._update_pose_utils()
-
-        self._connections = [
-            bind_combo(control, "mode", self.mode_select),
-            bind_combo(control, "layer_id", self.layer_select),
-            bind(control, "strength", self.strength_spin, "value"),
-            bind(control, "end", self.end_spin, "value"),
-            control.has_active_job_changed.connect(
-                lambda x: self.generate_button.setEnabled(not x)
-            ),
-            control.has_active_job_changed.connect(lambda x: self.layer_select.setEnabled(not x)),
-            control.error_text_changed.connect(self._set_error),
-            control.is_supported_changed.connect(self._update_visibility),
-            control.can_generate_changed.connect(self._update_visibility),
-            control.show_end_changed.connect(self._update_visibility),
-            control.mode_changed.connect(self._update_visibility),
-            control.is_pose_vector_changed.connect(self._update_pose_utils),
-        ]
-
-    def disconnect_all(self):
-        Binding.disconnect_all(self._connections)
-
-    def _update_layers(self):
-        layers = reversed(self._model.layers.images)
-        with SignalBlocker(self.layer_select):
-            self.layer_select.clear()
-            index = -1
-            for layer in layers:
-                self.layer_select.addItem(layer.name(), layer.uniqueId())
-                if layer.uniqueId() == self._control.layer_id:
-                    index = self.layer_select.count() - 1
-            if index == -1 and self._control in self._model.control:
-                self.remove()
-            else:
-                self.layer_select.setCurrentIndex(index)
-
-    def remove(self):
-        self._model.control.remove(self._control)
-
-    def _add_pose_character(self):
-        self._model.document.add_pose_character(self._control.layer)
-
-    def _update_visibility(self):
-        def controls():
-            self.layer_select.setVisible(self._control.is_supported)
-            self.generate_button.setVisible(self._control.can_generate)
-            self.add_pose_button.setVisible(
-                self._control.is_supported and self._control.mode is ControlMode.pose
-            )
-            self.strength_spin.setVisible(self._control.is_supported)
-            self.end_spin.setVisible(self._control.show_end)
-
-        def error():
-            self.error_text.setVisible(not self._control.is_supported)
-
-        if self._control.is_supported:
-            error()
-            controls()
-        else:  # always hide things to hide first to make space in the layout
-            controls()
-            error()
-
-    def _update_pose_utils(self):
-        self.add_pose_button.setEnabled(self._control.is_pose_vector)
-        self.add_pose_button.setToolTip(
-            "Add new character pose to selected layer"
-            if self._control.is_pose_vector
-            else "Disabled: selected layer must be a vector layer to add a pose"
-        )
-
-    def _set_error(self, error: str):
-        parts = error.split("[", 2)
-        self.error_text.setText(parts[0])
-        if len(parts) > 1:
-            self.error_text.setToolTip(f"Missing one of the following models: {parts[1][:-1]}")
-
-
-class ControlListWidget(QWidget):
-    _controls: list[ControlWidget]
-    _model: Model
-    _model_connections: list[QMetaObject.Connection]
-
-    changed = pyqtSignal()
-
-    def __init__(self, model: Model, parent=None):
-        super().__init__(parent)
-        self._model = model
-        self._controls = []
-        self._model_connections = []
-
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(self._layout)
-
-    @property
-    def model(self):
-        return self._model
-
-    @model.setter
-    def model(self, model: Model):
-        if self._model != model:
-            Binding.disconnect_all(self._model_connections)
-            self._model = model
-            while len(self._controls) > 0:
-                self._remove_widget(self._controls[0])
-            for control in self._model.control:
-                self._add_widget(control)
-            self._model_connections = [
-                model.control.added.connect(self._add_widget),
-                model.control.removed.connect(self._remove_widget),
-            ]
-
-    def _add_widget(self, control: ControlLayer):
-        widget = ControlWidget(self._model, control, self)
-        self._controls.append(widget)
-        self._layout.addWidget(widget)
-
-    def _remove_widget(self, widget: ControlWidget | ControlLayer):
-        if isinstance(widget, ControlLayer):
-            widget = next(w for w in self._controls if w._control == widget)
-        self._controls.remove(widget)
-        widget.disconnect_all()
-        widget.deleteLater()
-
-
-class ControlLayerButton(QToolButton):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.setIcon(theme.icon("control-add"))
-        self.setToolTip("Add control layer")
-        self.setAutoRaise(True)
-        icon_height = self.iconSize().height()
-        self.setIconSize(QSize(int(icon_height * 1.25), icon_height))
-
-
 class StyleSelectWidget(QWidget):
     _value: Style
     _styles: list[Style]
@@ -486,7 +276,6 @@ class StyleSelectWidget(QWidget):
             elif len(self._styles) > 0:
                 self._value = self._styles[0]
                 self._combo.setCurrentIndex(0)
-                self.value_changed.emit(self._value)
 
     def change_style(self):
         style = self._styles[self._combo.currentIndex()]
@@ -536,6 +325,70 @@ def handle_weight_adjustment(
             self.setCursorPosition(start + len(text_after_edit) - 2)
 
 
+class PromptAutoComplete:
+    _completer: QCompleter
+
+    def __init__(self, widget: QLineEdit):
+        self._widget = widget
+        self._completer = QCompleter()
+        self._completer.activated.connect(self._insert_completion)
+        self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setWidget(widget)
+        self._popup = ensure(self._completer.popup())
+
+        self._refresh_loras()
+        root.connection.state_changed.connect(self._refresh_loras)
+
+    def _refresh_loras(self):
+        if client := root.connection.client_if_connected:
+            loras = [LoraId.normalize(lora).name for lora in client.models.loras]
+            self._completer.setModel(QStringListModel(loras))
+
+    def _current_text(self) -> str:
+        text = self._widget.text()
+        start = pos = self._widget.cursorPosition()
+        while pos > 0 and text[pos - 1] not in " >\n":
+            pos -= 1
+        return text[pos:start]
+
+    def check_completion(self):
+        prefix = self._current_text()
+        name = prefix.removeprefix("<lora:")
+        if len(prefix) == len(name):
+            self._popup.hide()
+            return
+
+        self._completer.setCompletionPrefix(name)
+        rect = self._widget.cursorRect()
+        self._popup.setCurrentIndex(ensure(self._completer.completionModel()).index(0, 0))
+        scrollbar = ensure(self._popup.verticalScrollBar())
+        rect.setWidth(self._popup.sizeHintForColumn(0) + scrollbar.sizeHint().width())
+        self._completer.complete(rect)
+
+    def _insert_completion(self, completion):
+        text = self._widget.text()
+        pos = self._widget.cursorPosition()
+        prefix_len = len(self._completer.completionPrefix())
+        text = text[: pos - prefix_len] + completion + ">" + text[pos:]
+        self._widget.setText(text)
+        self._widget.setCursorPosition(pos - prefix_len + len(completion) + 1)
+
+    @property
+    def is_active(self):
+        return self._popup.isVisible()
+
+    action_keys = [
+        Qt.Key.Key_Enter,
+        Qt.Key.Key_Return,
+        Qt.Key.Key_Up,
+        Qt.Key.Key_Down,
+        Qt.Key.Key_Tab,
+        Qt.Key.Key_Backtab,
+    ]
+
+
 class MultiLineTextPromptWidget(QPlainTextEdit):
     activated = pyqtSignal()
 
@@ -546,11 +399,18 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTabChangesFocus(True)
+        self.setFrameStyle(QFrame.Shape.NoFrame)
         self.line_count = 2
-        self.is_negative = False
+
+        self._completer = PromptAutoComplete(self)
+        self.textChanged.connect(self._completer.check_completion)
 
     def keyPressEvent(self, e: QKeyEvent | None):
         assert e is not None
+        if self._completer.is_active and e.key() in PromptAutoComplete.action_keys:
+            e.ignore()
+            return
+
         handle_weight_adjustment(self, e)
 
         if e.key() == Qt.Key.Key_Return and e.modifiers() == Qt.KeyboardModifier.ShiftModifier:
@@ -566,7 +426,7 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
     def line_count(self, value: int):
         self._line_count = value
         fm = QFontMetrics(ensure(self.document()).defaultFont())
-        self.setFixedHeight(fm.lineSpacing() * value + 6)
+        self.setFixedHeight(fm.lineSpacing() * value + 8)
 
     def hasSelectedText(self) -> bool:
         return self.textCursor().hasSelection()
@@ -580,6 +440,11 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
     def cursorPosition(self) -> int:
         return self.textCursor().position()
 
+    def setCursorPosition(self, pos: int):
+        cursor = self.textCursor()
+        cursor.setPosition(pos)
+        self.setTextCursor(cursor)
+
     def text(self) -> str:
         return self.toPlainText()
 
@@ -588,19 +453,29 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
 
     def setSelection(self, start: int, end: int):
         new_cursor = self.textCursor()
-        new_cursor.setPosition(min(end, len(self.toPlainText())))
-        new_cursor.setPosition(min(start, len(self.toPlainText())), QTextCursor.KeepAnchor)
+        new_cursor.setPosition(min(end, len(self.text())))
+        new_cursor.setPosition(min(start, len(self.text())), QTextCursor.KeepAnchor)
         self.setTextCursor(new_cursor)
 
 
 class SingleLineTextPromptWidget(QLineEdit):
+
+    _completer: PromptAutoComplete
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._completer = PromptAutoComplete(self)
+        self.textChanged.connect(self._completer.check_completion)
+        self.setFrame(False)
+        self.setStyleSheet(f"QLineEdit {{ background: transparent; }}")
+
     def keyPressEvent(self, a0: QKeyEvent | None):
         assert a0 is not None
         handle_weight_adjustment(self, a0)
         super().keyPressEvent(a0)
 
 
-class TextPromptWidget(QWidget):
+class TextPromptWidget(QFrame):
     """Wraps a single or multi-line text widget, with ability to switch between them.
     Using QPlainTextEdit set to a single line doesn't work properly because it still
     scrolls to the next line when eg. selecting and then looks like it's empty."""
@@ -608,11 +483,8 @@ class TextPromptWidget(QWidget):
     activated = pyqtSignal()
     text_changed = pyqtSignal(str)
 
-    _multi: MultiLineTextPromptWidget
-    _single: QLineEdit
     _line_count = 2
     _is_negative = False
-    _base_color: QColor
 
     def __init__(self, line_count=2, is_negative=False, parent=None):
         super().__init__(parent)
@@ -621,7 +493,7 @@ class TextPromptWidget(QWidget):
         self._layout = QVBoxLayout()
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
         self._multi = MultiLineTextPromptWidget(self)
         self._multi.line_count = self._line_count
@@ -649,7 +521,7 @@ class TextPromptWidget(QWidget):
 
     @property
     def text(self):
-        return self._multi.toPlainText() if self._line_count > 1 else self._single.text()
+        return self._multi.text() if self._line_count > 1 else self._single.text()
 
     @text.setter
     def text(self, value: str):
@@ -681,20 +553,103 @@ class TextPromptWidget(QWidget):
     @is_negative.setter
     def is_negative(self, value: bool):
         self._is_negative = value
-        for w in [self._multi, self._single]:
-            palette: QPalette = w.palette()
-            color = self._base_color
+        for w in (self._multi, self._single):
             if not value:
                 w.setPlaceholderText("Describe the content you want to see, or leave empty.")
             else:
                 w.setPlaceholderText("Describe content you want to avoid.")
-                o = 8 if theme.is_dark else 16
-                color = QColor(color.red(), color.green() - o, color.blue() - o)
-            palette.setColor(QPalette.ColorRole.Base, color)
-            w.setPalette(palette)
+
+        if value:
+            self.setContentsMargins(0, 2, 0, 2)
+            self.setFrameStyle(QFrame.Shape.StyledPanel)
+            self.setStyleSheet(f"QFrame {{ background: rgba(255, 0, 0, 15); }}")
+        else:
+            self.setFrameStyle(QFrame.Shape.NoFrame)
+
+    @property
+    def has_focus(self):
+        return self._multi.hasFocus() or self._single.hasFocus()
+
+    @has_focus.setter
+    def has_focus(self, value: bool):
+        if value:
+            if self._line_count > 1:
+                self._multi.setFocus()
+            else:
+                self._single.setFocus()
+
+    def install_event_filter(self, obj: QObject):
+        self._multi.installEventFilter(obj)
+        self._single.installEventFilter(obj)
+
+    def move_cursor_to_end(self):
+        if self._line_count > 1:
+            cursor = self._multi.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._multi.setTextCursor(cursor)
+        else:
+            self._single.setCursorPosition(len(self._single.text()))
+
+
+class StrengthSnapping:
+    model: Model
+
+    def __init__(self, model: Model):
+        self.model = model
+
+    def get_steps(self) -> tuple[int, int]:
+        if self.model.workspace is Workspace.generation:
+            is_live = False
+        elif self.model.workspace is Workspace.upscaling:
+            assert False
+        elif self.model.workspace is Workspace.live:
+            is_live = True
+        elif self.model.workspace is Workspace.animation:
+            is_live = self.model.animation.sampling_quality is SamplingQuality.fast
+        else:
+            assert False, "unknown type of workspace"
+        return self.model.style.get_steps(is_live=is_live)
+
+    def nearest_percent(self, value: int) -> int | None:
+        _, max_steps = self.get_steps()
+        steps, start_at_step = self.apply_strength(value)
+        return snap_to_percent(steps, start_at_step, max_steps=max_steps)
+
+    def apply_strength(self, value: int) -> tuple[int, int]:
+        min_steps, max_steps = self.get_steps()
+        strength = value / 100
+        return apply_strength(strength, steps=max_steps, min_steps=min_steps)
+
+
+# SpinBox variant that allows manually entering strength values,
+# but snaps to model_steps on step actions (scrolling, arrows, arrow keys).
+class StrengthSpinBox(QSpinBox):
+    snapping: StrengthSnapping | None
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.snapping = None
+        # for manual input
+        self.setMinimum(1)
+        self.setMaximum(100)
+
+    def stepBy(self, steps):
+        value = max(self.minimum(), min(self.maximum(), self.value() + steps))
+        if self.snapping is not None:
+            # keep going until we hit a new snap point
+            current_point = self.nearest_snap_point(self.value())
+            while self.nearest_snap_point(value) == current_point and value > 1:
+                value += 1 if steps > 0 else -1
+            value = self.nearest_snap_point(value)
+        self.setValue(value)
+
+    def nearest_snap_point(self, value: int) -> int:
+        assert self.snapping
+        return self.snapping.nearest_percent(value) or (int(value / 5) * 5)
 
 
 class StrengthWidget(QWidget):
+    _model: Model | None
     value_changed = pyqtSignal(float)
 
     def __init__(self, slider_range: tuple[int, int] = (1, 100), parent=None):
@@ -703,29 +658,51 @@ class StrengthWidget(QWidget):
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(self._layout)
 
+        self._model = None
+
         self._slider = QSlider(Qt.Orientation.Horizontal, self)
         self._slider.setMinimum(slider_range[0])
         self._slider.setMaximum(slider_range[1])
         self._slider.setSingleStep(5)
-        self._slider.valueChanged.connect(self.notify_changed)
+        self._slider.valueChanged.connect(self.slider_changed)
 
-        self._input = QSpinBox(self)
-        self._input.setMinimum(1)
-        self._input.setMaximum(100)
-        self._input.setSingleStep(5)
+        self._input = StrengthSpinBox(self)
         self._input.setPrefix("Strength: ")
         self._input.setSuffix("%")
         self._input.valueChanged.connect(self.notify_changed)
 
+        settings.changed.connect(self.update_suffix)
+
         self._layout.addWidget(self._slider)
         self._layout.addWidget(self._input)
 
+    def slider_changed(self, value: int):
+        if self._input.snapping is not None:
+            value = self._input.snapping.nearest_percent(value) or value
+        self.notify_changed(value)
+
     def notify_changed(self, value: int):
+        self.update_suffix()
         if self._slider.value() != value:
             self._slider.setValue(value)
         if self._input.value() != value:
             self._input.setValue(value)
         self.value_changed.emit(self.value)
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        if self._model:
+            self._model.style_changed.disconnect(self.update_suffix)
+            self._model.animation.sampling_quality_changed.disconnect(self.update_suffix)
+        self._model = model
+        self._model.style_changed.connect(self.update_suffix)
+        self._model.animation.sampling_quality_changed.connect(self.update_suffix)
+        self._input.snapping = StrengthSnapping(self._model)
+        self.update_suffix()
 
     @property
     def value(self):
@@ -735,8 +712,17 @@ class StrengthWidget(QWidget):
     def value(self, value: float):
         if value == self.value:
             return
-        self._slider.setValue(int(value * 100))
-        self._input.setValue(int(value * 100))
+        self._slider.setValue(round(value * 100))
+        self._input.setValue(round(value * 100))
+        self.update_suffix()
+
+    def update_suffix(self):
+        if not self._input.snapping or not settings.show_steps:
+            self._input.setSuffix("%")
+            return
+
+        steps, start_at_step = self._input.snapping.apply_strength(self._input.value())
+        self._input.setSuffix(f"% ({steps - start_at_step}/{steps})")
 
 
 class WorkspaceSelectWidget(QToolButton):
@@ -785,6 +771,77 @@ class WorkspaceSelectWidget(QToolButton):
         action.setIconVisibleInMenu(True)
         action.triggered.connect(actions.set_workspace(workspace))
         return action
+
+
+class GenerateButton(QPushButton):
+    model: Model
+    operation: str
+    _kind: JobKind
+    _cost: int = 0
+    _cost_icon: QIcon
+
+    def __init__(self, kind: JobKind, parent: QWidget):
+        super().__init__(parent)
+        self.model = root.active_model
+        self.operation = "Generate"
+        self._kind = kind
+        self._cost_icon = theme.icon("interstice")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    def minimumSizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(fm.width(self.operation) + 40, 12 + int(1.3 * fm.height()))
+
+    def enterEvent(self, a0: QEvent | None):
+        if client := root.connection.client_if_connected:
+            if client.user:
+                self._cost = self.model.estimate_cost(self._kind)
+
+    def leaveEvent(self, a0: QEvent | None):
+        self._cost = 0
+
+    def paintEvent(self, a0: QPaintEvent | None) -> None:
+        opt = QStyleOption()
+        opt.initFrom(self)
+        painter = QPainter(self)
+        fm = self.fontMetrics()
+        style = ensure(self.style())
+        rect = self.rect()
+        pixmap = self.icon().pixmap(int(fm.height() * 1.3))
+        is_hover = int(opt.state) & QStyle.StateFlag.State_MouseOver
+        element = QStyle.PrimitiveElement.PE_PanelButtonCommand
+        vcenter = Qt.AlignmentFlag.AlignVCenter
+        content_width = fm.width(self.operation) + 5 + pixmap.width()
+        content_rect = rect.adjusted(int(0.5 * (rect.width() - content_width)), 0, 0, 0)
+        style.drawPrimitive(element, opt, painter, self)
+        style.drawItemPixmap(painter, content_rect, vcenter, pixmap)
+        content_rect = content_rect.adjusted(pixmap.width() + 5, 0, 0, 0)
+        style.drawItemText(painter, content_rect, vcenter, self.palette(), True, self.operation)
+
+        if is_hover and self._cost > 0:
+            cost_width = fm.width(str(self._cost))
+            pixmap = self._cost_icon.pixmap(fm.height())
+            cost_rect = rect.adjusted(rect.width() - pixmap.width() - cost_width - 16, 0, 0, 0)
+            painter.setOpacity(0.3)
+            painter.drawLine(
+                cost_rect.left(), cost_rect.top() + 6, cost_rect.left(), cost_rect.bottom() - 6
+            )
+            painter.setOpacity(0.7)
+            cost_rect = cost_rect.adjusted(6, 0, 0, 0)
+            style.drawItemText(painter, cost_rect, vcenter, self.palette(), True, str(self._cost))
+            cost_rect = cost_rect.adjusted(cost_width + 4, 0, 0, 0)
+            style.drawItemPixmap(painter, cost_rect, vcenter, pixmap)
+
+
+def create_wide_tool_button(icon_name: str, text: str, parent=None):
+    button = QToolButton(parent)
+    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+    button.setIcon(theme.icon(icon_name))
+    button.setToolTip(text)
+    button.setAutoRaise(True)
+    icon_height = button.iconSize().height()
+    button.setIconSize(QSize(int(icon_height * 1.25), icon_height))
+    return button
 
 
 def _paint_tool_drop_down(widget: QToolButton, text: str | None = None):

@@ -4,7 +4,7 @@ from enum import Enum
 from typing import NamedTuple, overload
 
 from .api import ExtentInput, ImageInput
-from .image import Bounds, Extent, Image, Mask, multiple_of
+from .image import Bounds, Extent, Image, Mask, Point, multiple_of
 from .resources import SDVersion
 from .settings import PerformanceSettings
 from .style import Style
@@ -147,6 +147,7 @@ class CheckpointResolution(NamedTuple):
             min_size, max_size, min_pixel_count, max_pixel_count = {
                 SDVersion.sd15: (512, 768, 512**2, 512 * 768),
                 SDVersion.sdxl: (896, 1280, 1024**2, 1024**2),
+                SDVersion.sd3: (512, 1536, 512**2, 1536**2),
             }[sd_ver]
         else:
             range_offset = multiple_of(round(0.2 * style.preferred_resolution), 8)
@@ -169,18 +170,16 @@ def apply_resolution_settings(extent: Extent, settings: PerformanceSettings):
 def prepare_diffusion_input(
     extent: Extent,
     image: Image | None,
-    mask: Mask | None,
     sd_version: SDVersion,
     style: Style,
     perf: PerformanceSettings,
     downscale=True,
 ):
-    mask_image = mask.to_image(extent) if mask else None
-
     # Take settings into account to compute the desired resolution for diffusion.
     desired = apply_resolution_settings(extent, perf)
 
     # The checkpoint may require a different resolution than what is requested.
+    mult = 64 if sd_version is SDVersion.sd3 else 8
     min_size, max_size, min_scale, max_scale = CheckpointResolution.compute(
         desired, sd_version, style
     )
@@ -188,11 +187,11 @@ def prepare_diffusion_input(
     if downscale and max_scale < 1 and any(x > max_size for x in desired):
         # Desired resolution is larger than the maximum size. Do 2 passes:
         # first pass at checkpoint resolution, then upscale to desired resolution and refine.
-        input = initial = (desired * max_scale).multiple_of(8)
-        desired = desired.multiple_of(8)
+        input = initial = (desired * max_scale).multiple_of(mult)
+        desired = desired.multiple_of(mult)
         # Input images are scaled down here for the initial pass directly to avoid encoding
         # and processing large images in subsequent steps.
-        image, mask_image = _scale_images(image, mask_image, target=initial)
+        image = Image.scale(image, initial) if image else None
 
     elif min_scale > 1 and all(x < min_size for x in desired):
         # Desired resolution is smaller than the minimum size. Do 1 pass at checkpoint resolution.
@@ -200,54 +199,37 @@ def prepare_diffusion_input(
         scaled = desired * min_scale
         # Avoid unnecessary scaling if too small resolution is caused by resolution multiplier
         if all(x >= min_size and x <= max_size for x in extent):
-            initial = desired = extent.multiple_of(8)
+            initial = desired = extent.multiple_of(mult)
         else:
-            initial = desired = scaled.multiple_of(8)
+            initial = desired = scaled.multiple_of(mult)
 
     else:  # Desired resolution is in acceptable range. Do 1 pass at desired resolution.
         input = extent
-        initial = desired = desired.multiple_of(8)
+        initial = desired = desired.multiple_of(mult)
         # Scale down input images if needed due to resolution_multiplier or max_pixel_count
         if extent.pixel_count > desired.pixel_count:
             input = desired
-            image, mask_image = _scale_images(image, mask_image, target=desired)
+            image = Image.scale(image, desired) if image else None
 
     batch = compute_batch_size(Extent.largest(initial, desired), 512, perf.batch_size)
-    return ScaledExtent(input, initial, desired, extent), image, mask_image, batch
+    return ScaledExtent(input, initial, desired, extent), image, batch
 
 
 def prepare_extent(
     extent: Extent, sd_ver: SDVersion, style: Style, perf: PerformanceSettings, downscale=True
 ):
-    scaled, _, _, batch = prepare_diffusion_input(
-        extent, None, None, sd_ver, style, perf, downscale
-    )
+    scaled, _, batch = prepare_diffusion_input(extent, None, sd_ver, style, perf, downscale)
     return ImageInput(scaled.as_input), batch
 
 
 def prepare_image(
     image: Image, sd_ver: SDVersion, style: Style, perf: PerformanceSettings, downscale=True
 ):
-    scaled, out_image, _, batch = prepare_diffusion_input(
-        image.extent, image, None, sd_ver, style, perf, downscale
+    scaled, out_image, batch = prepare_diffusion_input(
+        image.extent, image, sd_ver, style, perf, downscale
     )
     assert out_image is not None
     return ImageInput(scaled.as_input, out_image), batch
-
-
-def prepare_masked(
-    image: Image,
-    mask: Mask,
-    sd_ver: SDVersion,
-    style: Style,
-    perf: PerformanceSettings,
-    downscale=True,
-):
-    scaled, out_image, out_mask, batch = prepare_diffusion_input(
-        image.extent, image, mask, sd_ver, style, perf, downscale
-    )
-    assert out_image and out_mask
-    return ImageInput(scaled.as_input, out_image, out_mask), batch
 
 
 def prepare_control(image: Image, settings: PerformanceSettings):
@@ -256,10 +238,6 @@ def prepare_control(image: Image, settings: PerformanceSettings):
     if input != desired:
         image = Image.scale(image, desired)
     return ImageInput(ExtentInput(desired, desired, desired, input), image)
-
-
-def _scale_images(*imgs: Image | None, target: Extent):
-    return [Image.scale(img, target) if img else None for img in imgs]
 
 
 def get_inpaint_reference(image: Image, area: Bounds):
@@ -281,3 +259,54 @@ def get_inpaint_reference(image: Image, area: Bounds):
         if area.y == 0 or area.y + area.height == extent.height:
             return Image.crop(image, Bounds(0, offset, extent.width, extent.height - area.height))
     return None
+
+
+class TileLayout:
+    image_extent: Extent
+    tile_extent: Extent
+    min_size: int
+    padding: int
+    blending: int
+    tile_count: Extent
+
+    def __init__(self, extent: Extent, min_tile_size: int, padding: int):
+        self.image_extent = extent
+        self.min_size = min_tile_size
+        self.padding = padding
+        self.blending = max(1, self.padding // 16) * 8
+        self.tile_count = (self.image_extent // (min_tile_size - 2 * self.padding)).at_least(1)
+
+        padded = extent + (self.tile_count - Extent(1, 1)) * 2 * self.padding
+        tile_extent = Extent(
+            math.ceil(padded.width / self.tile_count.width),
+            math.ceil(padded.height / self.tile_count.height),
+        )
+        self.tile_extent = tile_extent.multiple_of(8)
+
+    @staticmethod
+    def from_denoise_strength(extent: Extent, min_tile_size: int, strength: float):
+        padding = round((16 + 64 * strength) / 8) * 8
+        return TileLayout(extent, min_tile_size, padding)
+
+    @property
+    def total_tiles(self):
+        return self.tile_count.width * self.tile_count.height
+
+    def start(self, coord: Point):
+        return Point(
+            coord.x * (self.tile_extent.width - 2 * self.padding),
+            coord.y * (self.tile_extent.height - 2 * self.padding),
+        )
+
+    def end(self, coord: Point):
+        end = self.start(coord) + self.tile_extent
+        return end.clamp(Bounds.from_extent(self.image_extent))
+
+    def coord(self, index: int):
+        # Note: this appears flipped compared to tile layout in tooling nodes, but
+        # that's because torch tensor uses [H x W] layout
+        return Point(index // self.tile_count.height, index % self.tile_count.height)
+
+    def bounds(self, index: int):
+        coord = self.coord(index)
+        return Bounds.from_points(self.start(coord), self.end(coord))

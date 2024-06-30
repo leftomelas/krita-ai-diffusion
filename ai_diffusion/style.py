@@ -1,5 +1,6 @@
 from __future__ import annotations
 from enum import Enum
+from typing import NamedTuple
 import json
 from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -7,21 +8,8 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from .api import CheckpointInput, LoraInput
 from .settings import Setting, settings
 from .resources import SDVersion
-from .util import encode_json, user_data_dir, client_logger as log
-
-sampler_options = [
-    "DDIM",
-    "Euler",
-    "Euler a",
-    "DPM++ 2M",
-    "DPM++ 2M Karras",
-    "DPM++ 2M SDE",
-    "DPM++ 2M SDE Karras",
-    "DPM++ SDE Karras",
-    "UniPC BH2",
-    "LCM",
-    "Lightning",
-]
+from .util import encode_json, read_json_with_comments
+from .util import plugin_dir, user_data_dir, client_logger as log
 
 
 class StyleSettings:
@@ -81,16 +69,17 @@ class StyleSettings:
         " noise schedule",
     )
 
+    self_attention_guidance = Setting(
+        "Enable SAG / Self-Attention Guidance",
+        False,
+        'Pay more attention to "difficult" parts of the image. Can improve fine details.',
+    )
+
     preferred_resolution = Setting(
         "Preferred Resolution", 0, "Image resolution the checkpoint was trained on"
     )
 
-    sampler = Setting(
-        "Sampler",
-        "DPM++ 2M Karras",
-        "The sampling strategy and scheduler",
-        items=sampler_options,
-    )
+    sampler = Setting("Sampler", "Default - DPM++ 2M", "The sampling strategy and scheduler")
 
     sampler_steps = Setting(
         "Sampler Steps",
@@ -104,7 +93,7 @@ class StyleSettings:
         "Value which indicates how closely image generation follows the text prompt",
     )
 
-    live_sampler = Setting("Sampler", "LCM", sampler.desc, items=sampler_options)
+    live_sampler = Setting("Sampler", "Realtime - Hyper", sampler.desc)
     live_sampler_steps = Setting("Sampler Steps", 6, sampler_steps.desc)
     live_cfg_scale = Setting("Guidance Strength (CFG Scale)", 1.8, cfg_scale.desc)
 
@@ -121,6 +110,7 @@ class Style:
     vae: str = StyleSettings.vae.default
     clip_skip: int = StyleSettings.clip_skip.default
     v_prediction_zsnr: bool = StyleSettings.v_prediction_zsnr.default
+    self_attention_guidance: bool = StyleSettings.self_attention_guidance.default
     preferred_resolution: int = StyleSettings.preferred_resolution.default
     sampler: str = StyleSettings.sampler.default
     sampler_steps: int = StyleSettings.sampler_steps.default
@@ -156,6 +146,13 @@ class Style:
                         log.warning(f"Style {filepath} has invalid value for {name}: {value}")
                         value = setting.default
                     setattr(style, name, value)
+
+            style.sampler = _map_sampler_preset(
+                filepath, style.sampler, style.sampler_steps, style.cfg_scale
+            )
+            style.live_sampler = _map_sampler_preset(
+                filepath, style.live_sampler, style.live_sampler_steps, style.live_cfg_scale
+            )
             return style
         except json.JSONDecodeError as e:
             log.warning(f"Failed to load style {filepath}: {e}")
@@ -182,8 +179,26 @@ class Style:
             clip_skip=self.clip_skip,
             v_prediction_zsnr=self.v_prediction_zsnr,
             loras=[LoraInput.from_dict(l) for l in self.loras],
+            self_attention_guidance=self.self_attention_guidance,
         )
         return result
+
+    def get_steps(self, is_live: bool) -> tuple[int, int]:
+        sampler_name = self.live_sampler if is_live else self.sampler
+        preset = SamplerPresets.instance()[sampler_name]
+        max_steps = self.live_sampler_steps if is_live else self.sampler_steps
+        max_steps = max_steps or preset.steps
+        min_steps = min(preset.minimum_steps, max_steps)
+        return min_steps, max_steps
+
+
+def _map_sampler_preset(filepath: str | Path, name: str, steps: int, cfg: float):
+    sampler_preset = SamplerPresets.instance().add_missing(name, steps, cfg)
+    if sampler_preset is not None:
+        return sampler_preset
+    else:
+        log.warning(f"Style {filepath} has invalid sampler preset {name}")
+        return StyleSettings.sampler.default
 
 
 class Styles(QObject):
@@ -277,3 +292,146 @@ class Styles(QObject):
 
     def __iter__(self):
         return iter(self._list)
+
+
+class SamplerPreset(NamedTuple):
+    sampler: str
+    scheduler: str
+    steps: int
+    cfg: float
+    lora: str | None = None
+    minimum_steps: int = 4
+
+
+class SamplerPresets:
+    default_preset_file = plugin_dir / "presets" / "samplers.json"
+    default_user_preset_file = user_data_dir / "presets" / "samplers.json"
+
+    _preset_file: Path
+    _user_preset_file: Path
+    _presets: dict[str, SamplerPreset]
+
+    _instance: SamplerPresets | None = None
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = SamplerPresets()
+        return cls._instance
+
+    def __init__(self, preset_file: Path | None = None, user_preset_file: Path | None = None):
+        self._preset_file = preset_file or self.default_preset_file
+        self._user_preset_file = user_preset_file or self.default_user_preset_file
+        self._presets = {}
+        self.load(self._preset_file)
+        if self._user_preset_file.exists():
+            self.load(self._user_preset_file)
+
+        if len(self._presets) == 0:
+            log.warning(
+                f"No sampler presets found in {self._preset_file} or {self._user_preset_file}"
+            )
+            self._presets["Default"] = SamplerPreset("dpmpp_2m", "karras", 20, 7.0)
+
+    def load(self, file: Path):
+        try:
+            presets = read_json_with_comments(file)
+            presets = {name: SamplerPreset(**preset) for name, preset in presets.items()}
+            self._presets.update(presets)
+            log.info(f"Loaded {len(presets)} sampler presets from {file}")
+        except Exception as e:
+            log.error(f"Failed to load sampler presets from {file}: {e}")
+
+    def add_missing(self, name: str, steps: int, cfg_scale: float):
+        if name in self._presets:
+            return name
+        if name in legacy_map:
+            return legacy_map[name]
+        if name in _sampler_map:
+            self._presets[name] = SamplerPreset(
+                sampler=_sampler_map[name],
+                scheduler=_scheduler_map[name],
+                steps=steps,
+                cfg=cfg_scale,
+            )
+            return name
+        return None
+
+    def write_stub(self):
+        if not self._user_preset_file.exists():
+            self._user_preset_file.parent.mkdir(parents=True, exist_ok=True)
+            self._user_preset_file.write_text(_sampler_presets_stub)
+        return self._user_preset_file
+
+    def __len__(self):
+        return len(self._presets)
+
+    def __getitem__(self, name: str) -> SamplerPreset:
+        if result := self._presets.get(name, None):
+            return result
+        if name in legacy_map:
+            return self[legacy_map[name]]
+        raise KeyError(f"Sampler preset {name} not found")
+
+    def items(self):
+        return self._presets.items()
+
+    def names(self):
+        return self._presets.keys()
+
+
+legacy_map = {
+    "DPM++ 2M Karras": "Default - DPM++ 2M",
+    "DPM++ 2M SDE Karras": "Creative - DPM++ 2M SDE",
+    "Euler a": "Alternative - Euler A",
+    "DPM++ SDE Karras": "Turbo/Lightning Merge - DPM++ SDE",
+    "Lightning": "Lightning Merge - Euler A Uniform",
+    "UniPC BH2": "Fast - UniPC BH2",
+    "LCM": "Realtime - LCM",
+    "Default": "Default - DPM++ 2M",
+    "Creative": "Creative - DPM++ 2M SDE",
+    "Turbo/Lightning Merge": "Turbo/Lightning Merge - DPM++ SDE",
+    "Fast": "Fast - UniPC BH2",
+    "Realtime LCM": "Realtime - LCM",
+    "Realtime Lightning": "Realtime - Lightning",
+}
+_sampler_map = {
+    "DDIM": "ddim",
+    "DPM++ 2M": "dpmpp_2m",
+    "DPM++ 2M Karras": "dpmpp_2m",
+    "DPM++ 2M SDE": "dpmpp_2m_sde_gpu",
+    "DPM++ 2M SDE Karras": "dpmpp_2m_sde_gpu",
+    "DPM++ SDE Karras": "dpmpp_sde_gpu",
+    "UniPC BH2": "uni_pc_bh2",
+    "LCM": "lcm",
+    "Lightning": "euler",
+    "Euler": "euler",
+    "Euler a": "euler_ancestral",
+}
+_scheduler_map = {
+    "DDIM": "ddim_uniform",
+    "DPM++ 2M": "normal",
+    "DPM++ 2M Karras": "karras",
+    "DPM++ 2M SDE": "normal",
+    "DPM++ 2M SDE Karras": "karras",
+    "DPM++ SDE Karras": "karras",
+    "UniPC BH2": "ddim_uniform",
+    "LCM": "sgm_uniform",
+    "Lightning": "sgm_uniform",
+    "Euler": "normal",
+    "Euler a": "normal",
+}
+_sampler_presets_stub = """// Custom sampler presets - add your own sampler presets here!
+// https://github.com/Acly/krita-ai-diffusion/wiki/Samplers
+//
+// *** You have to restart Krita for the changes to take effect! ***
+{
+    "My Custom Sampler - DPM++ 3M": {
+        "sampler": "dpmpp_3m_sde",
+        "scheduler": "exponential",
+        "steps": 20,
+        "minimum_steps": 4,
+        "cfg": 7.0
+    }
+}
+"""

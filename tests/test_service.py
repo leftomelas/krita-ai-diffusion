@@ -7,15 +7,15 @@ import asyncio
 import dotenv
 
 from ai_diffusion.api import WorkflowInput, WorkflowKind, ControlInput, ImageInput, CheckpointInput
-from ai_diffusion.api import SamplingInput, TextInput, ExtentInput
+from ai_diffusion.api import SamplingInput, ConditioningInput, ExtentInput
 from ai_diffusion.client import Client, ClientEvent
 from ai_diffusion.cloud_client import CloudClient
 from ai_diffusion.image import Extent, Image
-from ai_diffusion.resources import ControlMode
+from ai_diffusion.resources import ControlMode, SDVersion
 from ai_diffusion.util import ensure
 from .config import root_dir, test_dir, result_dir
 
-dotenv.load_dotenv(root_dir / "service" / ".env.local")
+dotenv.load_dotenv(root_dir / "service" / "web" / ".env.local")
 pod_main = root_dir / "service" / "pod" / "pod.py"
 run_dir = test_dir / "pod"
 
@@ -53,7 +53,7 @@ def pod_server(qtapp, pytestconfig):
         task.cancel()
         await process.communicate()
 
-    if pytestconfig.getoption("--no-pod-process") or pytestconfig.getoption("--ci"):
+    if not pytestconfig.getoption("--pod-process") or pytestconfig.getoption("--ci"):
         yield None  # For using local docker image or deployed serverless endpoint
     else:
         process, task = qtapp.run(start())
@@ -105,7 +105,7 @@ def create_simple_workflow():
         images=ImageInput.from_extent(Extent(512, 512)),
         models=CheckpointInput("dreamshaper_8.safetensors"),
         sampling=SamplingInput("dpmpp_2m", "normal", cfg_scale=5.0, total_steps=20),
-        text=TextInput("fluffy ball"),
+        conditioning=ConditioningInput("fluffy ball"),
         batch_count=2,
     )
 
@@ -124,8 +124,9 @@ def test_large_image(qtapp, cloud_client):
         images=ImageInput(ExtentInput(extent, extent, extent, extent), input_image),
         models=CheckpointInput("dreamshaper_8.safetensors"),
         sampling=SamplingInput("dpmpp_2m", "normal", cfg_scale=3.0, total_steps=10, start_step=4),
-        text=TextInput("beach, jungle"),
-        control=[ControlInput(ControlMode.blur, input_image)],
+        conditioning=ConditioningInput(
+            "beach, jungle", control=[ControlInput(ControlMode.blur, input_image)]
+        ),
     )
     run_and_save(qtapp, cloud_client, workflow, "pod_large_image")
 
@@ -139,10 +140,64 @@ def test_validation(qtapp, cloud_client: CloudClient, scenario: str):
         ensure(workflow.sampling).total_steps = 200
     elif scenario == "control":
         img = Image.create(Extent(4, 4))
+        control = ensure(workflow.conditioning).control
         for i in range(7):
-            workflow.control.append(ControlInput(ControlMode.depth, img))
+            control.append(ControlInput(ControlMode.depth, img))
     elif scenario == "max_pixels":
         workflow.images = ImageInput.from_extent(Extent(3840, 2168))  # > 4k
 
     with pytest.raises(Exception, match="Validation error"):
         run_and_save(qtapp, cloud_client, workflow, "pod_validation")
+
+
+cost_params = {
+    "sd15-live-512x512": (SDVersion.sd15, 1, 512, 512, 1),
+    "sd15-8x512x512": (SDVersion.sd15, 8, 512, 512, 20),
+    "sd15-2x1024x1024": (SDVersion.sd15, 2, 1024, 1024, 20),
+    "sd15-1x1024x2048": (SDVersion.sd15, 1, 1024, 2048, 20),
+    "sdxl-2x1024x1024": (SDVersion.sdxl, 2, 1024, 1024, 20),
+    "sdxl-highstep": (SDVersion.sdxl, 1, 1536, 1024, 50),
+    "sdxl-refine": (SDVersion.sdxl, 1, 1536, 1024, 20),
+    "inpaint-initial": (SDVersion.sdxl, 2, 1024, 1024, 24),
+    "inpaint-crop": (SDVersion.sd15, 2, 512, 512, 24),
+    "upscale-tiled": (SDVersion.sd15, 1, 512, 512, 10),
+    "upscale-tiled-2": (SDVersion.sd15, 1, 320, 640, 10),
+    "upscaled-invalid": (SDVersion.sd15, 1, 512, 512, 10),
+}
+
+
+@pytest.mark.parametrize("params", cost_params.keys())
+def test_compute_cost(qtapp, cloud_client: CloudClient, params):
+    sdversion, batch_count, width, height, steps = cost_params[params]
+    extent = Extent(width, height)
+    input = WorkflowInput(
+        WorkflowKind.generate,
+        images=ImageInput.from_extent(extent),
+        models=CheckpointInput("ckpt", sdversion),
+        sampling=SamplingInput("dpmpp_2m", "normal", cfg_scale=5.0, total_steps=steps),
+        batch_count=batch_count,
+    )
+    if params == "sdxl-refine":
+        input.kind = WorkflowKind.refine
+        ensure(input.sampling).start_step = 16
+    elif params == "inpaint-initial":
+        input.kind = WorkflowKind.inpaint
+        input.crop_upscale_extent = Extent(640, 768)
+    elif params == "inpaint-crop":
+        input.kind = WorkflowKind.inpaint
+        input.crop_upscale_extent = Extent(1024, 768)
+    elif params == "upscale-tiled":
+        input.kind = WorkflowKind.upscale_tiled
+        input.extent.target = Extent(1024, 1024)
+    elif params == "upscale-tiled-2":
+        input.kind = WorkflowKind.upscale_tiled
+        input.extent.target = Extent(2000, 1600)
+    elif params == "upscaled-invalid":
+        input.kind = WorkflowKind.upscale_tiled
+        input.extent.target = Extent(200, 200)
+
+    async def check():
+        service_cost = await cloud_client.compute_cost(input)
+        assert service_cost == input.cost
+
+    qtapp.run(check())
